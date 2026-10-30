@@ -11,7 +11,8 @@
 
 // 1 = nur mithören (es wird nichts gesendet), alle Frames werden ausgegeben
 // 0 = OBD-Anfragen (Mode 01) senden und Antworten dekodieren
-#define LISTEN_ONLY 1
+#define LISTEN_ONLY 0
+#define DEBUG 1
 
 static const uint32_t OBD_REQUEST_ID  = 0x7DF;  // Broadcast-Anfrage
 static const uint32_t OBD_RESPONSE_ID = 0x7E8;  // Motorsteuergerät
@@ -41,10 +42,7 @@ static bool canBegin() {
   twai_filter_config_t f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 #else
   twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
-  twai_filter_config_t f;
-  f.acceptance_code = (uint32_t)OBD_RESPONSE_ID << 21;
-  f.acceptance_mask = ~((uint32_t)0x7FF << 21);
-  f.single_filter = true;
+  twai_filter_config_t f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 #endif
   twai_timing_config_t t = TWAI_TIMING_CONFIG_500KBITS();
 
@@ -140,6 +138,93 @@ static void printSupportedPids(uint8_t base) {
   Serial.println();
 }
 
+static void printCanStatus() {
+  twai_status_info_t s;
+  if (twai_get_status_info(&s) != ESP_OK) return;
+  Serial.printf("state=%d tx_err=%u rx_err=%u tx_failed=%u bus_err=%u rx_queue=%u\n",
+                s.state, (unsigned)s.tx_error_counter, (unsigned)s.rx_error_counter,
+                (unsigned)s.tx_failed_count, (unsigned)s.bus_error_count,
+                (unsigned)s.msgs_to_rx);
+}
+
+
+static twai_timing_config_t timingFor(int kbit) {
+  switch (kbit) {
+    case 250:  { twai_timing_config_t t = TWAI_TIMING_CONFIG_250KBITS(); return t; }
+    case 125:  { twai_timing_config_t t = TWAI_TIMING_CONFIG_125KBITS(); return t; }
+    case 1000: { twai_timing_config_t t = TWAI_TIMING_CONFIG_1MBITS();   return t; }
+    default:   { twai_timing_config_t t = TWAI_TIMING_CONFIG_500KBITS(); return t; }
+  }
+}
+
+static void scanBitrates() {
+  const int rates[] = {500, 250, 125, 1000};
+  for (int kbit : rates) {
+    twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
+    twai_timing_config_t t = timingFor(kbit);
+    twai_filter_config_t f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+    if (twai_driver_install(&g, &t, &f) != ESP_OK) continue;
+    twai_start();
+    sendRequest(0x00);
+    delay(300);
+    twai_status_info_t s;
+    twai_get_status_info(&s);
+    Serial.printf("%4d kbit/s: tx_err=%u bus_err=%u rx_queue=%u\n", kbit,
+                  (unsigned)s.tx_error_counter, (unsigned)s.bus_error_count,
+                  (unsigned)s.msgs_to_rx);
+    twai_stop();
+    twai_driver_uninstall();
+  }
+}
+
+static void sendRequestTo(uint32_t id, uint8_t pid) {
+  twai_message_t m = {};
+  m.identifier = id;
+  m.data_length_code = 8;
+  m.data[0] = 0x02; m.data[1] = 0x01; m.data[2] = pid;
+  twai_transmit(&m, pdMS_TO_TICKS(50));
+}
+
+static void dumpFor(uint32_t ms) {
+  uint32_t start = millis();
+  int n = 0;
+  while (millis() - start < ms) {
+    twai_message_t rx;
+    if (twai_receive(&rx, pdMS_TO_TICKS(20)) == ESP_OK) {
+      n++;
+      Serial.printf("  RX ID 0x%03X [%d]:", (unsigned)rx.identifier, rx.data_length_code);
+      for (int i = 0; i < rx.data_length_code; i++) Serial.printf(" %02X", rx.data[i]);
+      Serial.println();
+    }
+  }
+  if (n == 0) Serial.println("  nichts empfangen");
+}
+
+static void probeTp20(uint8_t dest) {
+  twai_message_t m = {};
+  m.identifier = 0x200;      // TP-2.0-Kanalaufbau
+  m.data_length_code = 7;
+  m.data[0] = dest;          // 0x01 = Motorsteuergerät
+  m.data[1] = 0xC0;          // Setup-Request
+  m.data[2] = 0x00;
+  m.data[3] = 0x10;
+  m.data[4] = 0x00;
+  m.data[5] = 0x03;
+  m.data[6] = 0x01;
+  Serial.printf("TP2.0 Kanalaufbau zu 0x%02X\n", dest);
+  twai_transmit(&m, pdMS_TO_TICKS(50));
+  dumpFor(500);
+}
+
+static void probe() {
+  const uint32_t ids[] = {0x7DF, 0x7E0};
+  for (uint32_t id : ids) {
+    Serial.printf("Anfrage PID 0x00 an ID 0x%03X\n", (unsigned)id);
+    sendRequestTo(id, 0x00);
+    dumpFor(500);
+  }
+  probeTp20(0x01);
+}
 // ---------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
@@ -148,7 +233,12 @@ void setup() {
 
   if (!canBegin()) {
     while (true) delay(1000);
+    #if DEBUG
+      Serial.println("Error Canbegin");
+    #endif
   }
+
+  probe();
 
 #if LISTEN_ONLY
   Serial.println("Modus: nur mithoeren (LISTEN_ONLY)");
@@ -158,10 +248,16 @@ void setup() {
   printSupportedPids(0x20);
   printSupportedPids(0x40);
 #endif
+
+  printCanStatus();
 }
 
 void loop() {
   canCheckBus();
+
+#if DEBUG
+  //Serial.println("Can checked");
+#endif
 
 #if LISTEN_ONLY
   twai_message_t rx;
