@@ -2,49 +2,36 @@
 #include "driver/twai.h"
 
 // ---------------------------------------------------------------------------
-// OBDScanner: OBD-II über CAN (ISO 15765-4, 500 kbit/s, 11-Bit-IDs)
+// OBDScanner: VW-Diagnose über CAN mit TP 2.0 (KWP2000), 500 kbit/s
 // ESP32 + SN65HVD230 (D -> CAN_TX_PIN, R -> CAN_RX_PIN, RS -> GND)
+//
+// Ablauf: Kanalaufbau -> Kanalparameter -> StartDiagnosticSession (10 89)
+//         -> ECU-Kennung lesen (1A 9B) -> Messwertbloecke lesen (21 xx)
+//
+// Es werden ausschliesslich lesende Dienste verwendet.
 // ---------------------------------------------------------------------------
 
 #define CAN_TX_PIN GPIO_NUM_21
 #define CAN_RX_PIN GPIO_NUM_22
 
-// 1 = nur mithören (es wird nichts gesendet), alle Frames werden ausgegeben
-// 0 = OBD-Anfragen (Mode 01) senden und Antworten dekodieren
-#define LISTEN_ONLY 0
-#define DEBUG 1
+static const uint8_t ECU_ADDR = 0x01;  // logische Adresse: Motorsteuergeraet
 
-static const uint32_t OBD_REQUEST_ID  = 0x7DF;  // Broadcast-Anfrage
-static const uint32_t OBD_RESPONSE_ID = 0x7E8;  // Motorsteuergerät
+// Messwertbloecke, die zyklisch gelesen werden
+static const uint8_t BLOCKS[] = {1, 2, 3, 4};
 
-struct PidInfo {
-  uint8_t id;
-  const char *name;
-  const char *unit;
-};
-
-static const PidInfo PIDS[] = {
-    {0x0C, "Drehzahl", "U/min"},
-    {0x0D, "Geschwindigkeit", "km/h"},
-    {0x05, "Kuehlmitteltemp.", "C"},
-    {0x0F, "Ansauglufttemp.", "C"},
-    {0x04, "Motorlast", "%"},
-    {0x0B, "Ladedruck (MAP abs.)", "kPa"},
-    {0x10, "Luftmasse (MAF)", "g/s"},
-};
+static uint32_t txId = 0;  // ID, auf der der Tester sendet (Steuergeraet hoert zu)
+static uint32_t rxId = 0;  // ID, auf der das Steuergeraet sendet
+static uint8_t txSeq = 0;
+static bool connected = false;
 
 // ---------------------------------------------------------------------------
-// TWAI-Treiber starten
+// CAN-Grundfunktionen
 // ---------------------------------------------------------------------------
 static bool canBegin() {
-#if LISTEN_ONLY
-  twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_LISTEN_ONLY);
-  twai_filter_config_t f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
-#else
   twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
-  twai_filter_config_t f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
-#endif
+  g.rx_queue_len = 32;
   twai_timing_config_t t = TWAI_TIMING_CONFIG_500KBITS();
+  twai_filter_config_t f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
   if (twai_driver_install(&g, &t, &f) != ESP_OK) {
     Serial.println("FEHLER: twai_driver_install");
@@ -57,9 +44,6 @@ static bool canBegin() {
   return true;
 }
 
-// ---------------------------------------------------------------------------
-// Bus-Off automatisch beheben
-// ---------------------------------------------------------------------------
 static void canCheckBus() {
   twai_status_info_t s;
   if (twai_get_status_info(&s) != ESP_OK) return;
@@ -71,217 +55,242 @@ static void canCheckBus() {
   }
 }
 
-// ---------------------------------------------------------------------------
-// OBD-Anfrage senden / Antwort abwarten
-// ---------------------------------------------------------------------------
-static bool sendRequest(uint8_t pid) {
+static bool canSend(uint32_t id, const uint8_t *d, uint8_t len) {
   twai_message_t m = {};
-  m.identifier = OBD_REQUEST_ID;
-  m.data_length_code = 8;
-  m.data[0] = 0x02;  // Anzahl der folgenden Nutzbytes
-  m.data[1] = 0x01;  // Mode 01: aktuelle Daten
-  m.data[2] = pid;
+  m.identifier = id;
+  m.data_length_code = len;
+  memcpy(m.data, d, len);
   return twai_transmit(&m, pdMS_TO_TICKS(50)) == ESP_OK;
 }
 
-// Wartet bis zu timeoutMs auf die Antwort zur angefragten PID.
-static bool waitResponse(uint8_t pid, twai_message_t &out, uint32_t timeoutMs) {
+// Wartet auf einen Frame mit der angegebenen ID, andere Frames werden verworfen.
+static bool canRecv(uint32_t id, twai_message_t &m, uint32_t timeoutMs) {
   uint32_t start = millis();
   while (millis() - start < timeoutMs) {
-    twai_message_t rx;
-    if (twai_receive(&rx, pdMS_TO_TICKS(20)) != ESP_OK) continue;
-    if (rx.identifier == OBD_RESPONSE_ID && rx.data[1] == 0x41 && rx.data[2] == pid) {
-      out = rx;
-      return true;
-    }
+    if (twai_receive(&m, pdMS_TO_TICKS(10)) != ESP_OK) continue;
+    if (m.identifier == id) return true;
   }
   return false;
 }
 
+static void printHex(const uint8_t *d, int n) {
+  for (int i = 0; i < n; i++) Serial.printf("%02X ", d[i]);
+  Serial.println();
+}
+
 // ---------------------------------------------------------------------------
-// Umrechnung der Rohwerte (Formeln nach SAE J1979)
+// TP 2.0: Kanal auf- und abbauen
 // ---------------------------------------------------------------------------
-static bool decodePid(uint8_t pid, const uint8_t *d, float &v) {
-  const float A = d[3];
-  const float B = d[4];
-  switch (pid) {
-    case 0x04: v = A * 100.0f / 255.0f; return true;
-    case 0x05: v = A - 40.0f; return true;
-    case 0x0B: v = A; return true;
-    case 0x0C: v = (256.0f * A + B) / 4.0f; return true;
-    case 0x0D: v = A; return true;
-    case 0x0F: v = A - 40.0f; return true;
-    case 0x10: v = (256.0f * A + B) / 100.0f; return true;
+static bool sendChannelParams(uint8_t opcode) {
+  // A0 = Parameteranfrage (Tester), A1 = Antwort
+  // Blockgroesse 15, T1 = 100 ms, T3 = 5 ms
+  const uint8_t par[6] = {opcode, 0x0F, 0x8A, 0xFF, 0x32, 0xFF};
+  return canSend(txId, par, 6);
+}
+
+static bool tp20Connect() {
+  twai_clear_receive_queue();
+
+  const uint8_t req[7] = {ECU_ADDR, 0xC0, 0x00, 0x10, 0x00, 0x03, 0x01};
+  if (!canSend(0x200, req, 7)) return false;
+
+  twai_message_t r;
+  if (!canRecv(0x200 + ECU_ADDR, r, 1000) || r.data[1] != 0xD0) {
+    Serial.println("Kanalaufbau fehlgeschlagen");
+    return false;
+  }
+  rxId = r.data[2] | ((r.data[3] & 0x0F) << 8);
+  txId = r.data[4] | ((r.data[5] & 0x0F) << 8);
+  Serial.printf("Kanal: Tester sendet auf 0x%03X, Steuergeraet auf 0x%03X\n",
+                (unsigned)txId, (unsigned)rxId);
+  twai_clear_receive_queue();  // wiederholte Setup-Antworten verwerfen
+
+  sendChannelParams(0xA0);
+  if (!canRecv(rxId, r, 1000) || r.data[0] != 0xA1) {
+    Serial.println("Kanalparameter nicht bestaetigt");
+    return false;
+  }
+  txSeq = 0;
+  return true;
+}
+
+static void tp20Disconnect() {
+  if (!connected) return;
+  const uint8_t a8 = 0xA8;
+  canSend(txId, &a8, 1);
+  twai_message_t m;
+  canRecv(rxId, m, 300);
+  connected = false;
+}
+
+// ---------------------------------------------------------------------------
+// TP 2.0: KWP2000-Nachrichten senden und empfangen
+// ---------------------------------------------------------------------------
+
+// Sendet eine Nachricht von bis zu 5 Nutzbytes als einzelnes Paket.
+static bool tp20Send(const uint8_t *p, uint8_t len) {
+  if (len > 5) return false;
+  uint8_t f[8];
+  f[0] = 0x10 | (txSeq & 0x0F);  // letztes Paket, Quittung erwartet
+  f[1] = 0x00;
+  f[2] = len;
+  memcpy(f + 3, p, len);
+  txSeq = (txSeq + 1) & 0x0F;
+  return canSend(txId, f, 3 + len);
+}
+
+// Empfaengt eine komplette Antwort. Rueckgabe: Laenge, -1 = Timeout, -2 = Kanal beendet
+static int tp20Receive(uint8_t *buf, size_t bufSize, uint32_t timeoutMs) {
+  size_t got = 0;
+  bool started = false;
+  uint32_t start = millis();
+
+  while (millis() - start < timeoutMs) {
+    twai_message_t m;
+    if (!canRecv(rxId, m, 50)) continue;
+
+    if (m.data[0] == 0xA3) {  // Kanaltest vom Steuergeraet
+      sendChannelParams(0xA1);
+      continue;
+    }
+    if (m.data[0] == 0xA8) return -2;  // Steuergeraet beendet den Kanal
+
+    uint8_t op = m.data[0] >> 4;
+    uint8_t seq = m.data[0] & 0x0F;
+    if (op > 3) continue;  // Quittungen (0xB) und Sonstiges ignorieren
+
+    int off = 1;
+    if (!started) {
+      off = 3;  // erstes Paket: 2 Bytes Laenge ueberspringen
+      started = true;
+      got = 0;
+    }
+    for (int i = off; i < m.data_length_code && got < bufSize; i++) buf[got++] = m.data[i];
+
+    if (op == 0 || op == 1) {  // Quittung gewuenscht
+      uint8_t ack = 0xB0 | ((seq + 1) & 0x0F);
+      canSend(txId, &ack, 1);
+    }
+    if (op == 1 || op == 3) {  // letztes Paket
+      if (got >= 3 && buf[0] == 0x7F && buf[2] == 0x78) {
+        // "Antwort folgt": weiter warten
+        started = false;
+        got = 0;
+        start = millis();
+        continue;
+      }
+      return (int)got;
+    }
+  }
+  return -1;
+}
+
+static int kwp(const uint8_t *req, uint8_t len, uint8_t *resp, size_t size, uint32_t timeoutMs = 1500) {
+  if (!tp20Send(req, len)) return -3;
+  return tp20Receive(resp, size, timeoutMs);
+}
+
+// ---------------------------------------------------------------------------
+// Messwerte
+// ---------------------------------------------------------------------------
+
+// Einheiten-Byte (Typ) -> Umrechnung. Nur wenige Typen, aus dem Gedaechtnis
+// uebernommen: bitte gegen bekannte Werte pruefen (z. B. Leerlaufdrehzahl).
+static bool decodeMeasure(uint8_t t, uint8_t a, uint8_t b, float &v, const char *&unit) {
+  switch (t) {
+    case 0x01: v = 0.2f * a * b;          unit = "U/min"; return true;
+    case 0x05: v = a * (b - 100) * 0.1f;  unit = "C";     return true;
+    case 0x06: v = 0.001f * a * b;        unit = "V";     return true;
+    case 0x07: v = 0.01f * a * b;         unit = "km/h";  return true;
+    case 0x12: v = 0.04f * a * b;         unit = "mbar";  return true;
     default: return false;
   }
 }
 
-// ---------------------------------------------------------------------------
-// Unterstützte PIDs abfragen (PID 0x00, 0x20, 0x40, ...)
-// ---------------------------------------------------------------------------
-static void printSupportedPids(uint8_t base) {
-  if (!sendRequest(base)) {
-    Serial.printf("Senden von PID 0x%02X fehlgeschlagen\n", base);
-    return;
-  }
-  twai_message_t rx;
-  if (!waitResponse(base, rx, 300)) {
-    Serial.printf("Keine Antwort auf PID 0x%02X\n", base);
-    return;
-  }
-  uint32_t mask = ((uint32_t)rx.data[3] << 24) | ((uint32_t)rx.data[4] << 16) |
-                  ((uint32_t)rx.data[5] << 8) | rx.data[6];
-  Serial.printf("Unterstuetzt ab 0x%02X:", base + 1);
-  for (int i = 0; i < 32; i++) {
-    if (mask & (1UL << (31 - i))) Serial.printf(" %02X", base + 1 + i);
+static void printBlock(uint8_t group, const uint8_t *r, int n) {
+  Serial.printf("Block %03u:", group);
+  for (int i = 2; i + 2 < n; i += 3) {
+    float v;
+    const char *unit;
+    if (decodeMeasure(r[i], r[i + 1], r[i + 2], v, unit)) {
+      Serial.printf("  [%02X %3u %3u] = %.1f %s", r[i], r[i + 1], r[i + 2], v, unit);
+    } else {
+      Serial.printf("  [%02X %3u %3u]", r[i], r[i + 1], r[i + 2]);
+    }
   }
   Serial.println();
 }
 
-static void printCanStatus() {
-  twai_status_info_t s;
-  if (twai_get_status_info(&s) != ESP_OK) return;
-  Serial.printf("state=%d tx_err=%u rx_err=%u tx_failed=%u bus_err=%u rx_queue=%u\n",
-                s.state, (unsigned)s.tx_error_counter, (unsigned)s.rx_error_counter,
-                (unsigned)s.tx_failed_count, (unsigned)s.bus_error_count,
-                (unsigned)s.msgs_to_rx);
-}
+// ---------------------------------------------------------------------------
+// Sitzung aufbauen
+// ---------------------------------------------------------------------------
+static bool openSession() {
+  if (!tp20Connect()) return false;
+  connected = true;
 
-
-static twai_timing_config_t timingFor(int kbit) {
-  switch (kbit) {
-    case 250:  { twai_timing_config_t t = TWAI_TIMING_CONFIG_250KBITS(); return t; }
-    case 125:  { twai_timing_config_t t = TWAI_TIMING_CONFIG_125KBITS(); return t; }
-    case 1000: { twai_timing_config_t t = TWAI_TIMING_CONFIG_1MBITS();   return t; }
-    default:   { twai_timing_config_t t = TWAI_TIMING_CONFIG_500KBITS(); return t; }
+  uint8_t resp[64];
+  const uint8_t start[2] = {0x10, 0x89};  // StartDiagnosticSession
+  int n = kwp(start, 2, resp, sizeof(resp));
+  Serial.print("StartDiagnosticSession: ");
+  if (n > 0) printHex(resp, n); else Serial.printf("Fehler %d\n", n);
+  if (n < 2 || resp[0] != 0x50) {
+    tp20Disconnect();
+    return false;
   }
-}
 
-static void scanBitrates() {
-  const int rates[] = {500, 250, 125, 1000};
-  for (int kbit : rates) {
-    twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
-    twai_timing_config_t t = timingFor(kbit);
-    twai_filter_config_t f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
-    if (twai_driver_install(&g, &t, &f) != ESP_OK) continue;
-    twai_start();
-    sendRequest(0x00);
-    delay(300);
-    twai_status_info_t s;
-    twai_get_status_info(&s);
-    Serial.printf("%4d kbit/s: tx_err=%u bus_err=%u rx_queue=%u\n", kbit,
-                  (unsigned)s.tx_error_counter, (unsigned)s.bus_error_count,
-                  (unsigned)s.msgs_to_rx);
-    twai_stop();
-    twai_driver_uninstall();
+  const uint8_t ident[2] = {0x1A, 0x9B};  // ECU-Kennung lesen
+  n = kwp(ident, 2, resp, sizeof(resp));
+  Serial.print("ECU-Kennung: ");
+  if (n > 0) {
+    printHex(resp, n);
+    Serial.print("  Text: ");
+    for (int i = 2; i < n; i++) Serial.print((resp[i] >= 32 && resp[i] < 127) ? (char)resp[i] : '.');
+    Serial.println();
+  } else {
+    Serial.printf("Fehler %d\n", n);
   }
+  return true;
 }
 
-static void sendRequestTo(uint32_t id, uint8_t pid) {
-  twai_message_t m = {};
-  m.identifier = id;
-  m.data_length_code = 8;
-  m.data[0] = 0x02; m.data[1] = 0x01; m.data[2] = pid;
-  twai_transmit(&m, pdMS_TO_TICKS(50));
-}
-
-static void dumpFor(uint32_t ms) {
-  uint32_t start = millis();
-  int n = 0;
-  while (millis() - start < ms) {
-    twai_message_t rx;
-    if (twai_receive(&rx, pdMS_TO_TICKS(20)) == ESP_OK) {
-      n++;
-      Serial.printf("  RX ID 0x%03X [%d]:", (unsigned)rx.identifier, rx.data_length_code);
-      for (int i = 0; i < rx.data_length_code; i++) Serial.printf(" %02X", rx.data[i]);
-      Serial.println();
-    }
-  }
-  if (n == 0) Serial.println("  nichts empfangen");
-}
-
-static void probeTp20(uint8_t dest) {
-  twai_message_t m = {};
-  m.identifier = 0x200;      // TP-2.0-Kanalaufbau
-  m.data_length_code = 7;
-  m.data[0] = dest;          // 0x01 = Motorsteuergerät
-  m.data[1] = 0xC0;          // Setup-Request
-  m.data[2] = 0x00;
-  m.data[3] = 0x10;
-  m.data[4] = 0x00;
-  m.data[5] = 0x03;
-  m.data[6] = 0x01;
-  Serial.printf("TP2.0 Kanalaufbau zu 0x%02X\n", dest);
-  twai_transmit(&m, pdMS_TO_TICKS(50));
-  dumpFor(500);
-}
-
-static void probe() {
-  const uint32_t ids[] = {0x7DF, 0x7E0};
-  for (uint32_t id : ids) {
-    Serial.printf("Anfrage PID 0x00 an ID 0x%03X\n", (unsigned)id);
-    sendRequestTo(id, 0x00);
-    dumpFor(500);
-  }
-  probeTp20(0x01);
-}
 // ---------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\nOBDScanner startet");
+  Serial.println("\nOBDScanner startet (TP 2.0)");
 
   if (!canBegin()) {
     while (true) delay(1000);
-    #if DEBUG
-      Serial.println("Error Canbegin");
-    #endif
   }
-
-  probe();
-
-#if LISTEN_ONLY
-  Serial.println("Modus: nur mithoeren (LISTEN_ONLY)");
-#else
-  Serial.println("Modus: OBD-Abfragen");
-  printSupportedPids(0x00);
-  printSupportedPids(0x20);
-  printSupportedPids(0x40);
-#endif
-
-  printCanStatus();
 }
 
 void loop() {
   canCheckBus();
 
-#if DEBUG
-  //Serial.println("Can checked");
-#endif
-
-#if LISTEN_ONLY
-  twai_message_t rx;
-  if (twai_receive(&rx, pdMS_TO_TICKS(100)) == ESP_OK) {
-    Serial.printf("ID 0x%03X [%d]:", (unsigned)rx.identifier, rx.data_length_code);
-    for (int i = 0; i < rx.data_length_code; i++) Serial.printf(" %02X", rx.data[i]);
-    Serial.println();
+  if (!connected) {
+    if (!openSession()) {
+      Serial.println("Verbindung fehlgeschlagen, neuer Versuch in 3 s");
+      delay(3000);
+    }
+    return;
   }
-#else
-  for (const PidInfo &p : PIDS) {
-    if (!sendRequest(p.id)) {
-      Serial.printf("%-22s Senden fehlgeschlagen\n", p.name);
-      continue;
-    }
-    twai_message_t rx;
-    float v;
-    if (waitResponse(p.id, rx, 200) && decodePid(p.id, rx.data, v)) {
-      Serial.printf("%-22s %8.1f %s\n", p.name, v, p.unit);
+
+  for (uint8_t g : BLOCKS) {
+    uint8_t req[2] = {0x21, g};  // readDataByLocalIdentifier (Messwertblock)
+    uint8_t resp[64];
+    int n = kwp(req, 2, resp, sizeof(resp));
+    if (n >= 2 && resp[0] == 0x61) {
+      printBlock(g, resp, n);
+    } else if (n >= 3 && resp[0] == 0x7F) {
+      Serial.printf("Block %03u: Steuergeraet lehnt ab (Dienst %02X, Code %02X)\n", g, resp[1], resp[2]);
     } else {
-      Serial.printf("%-22s keine Antwort\n", p.name);
+      Serial.printf("Block %03u: Fehler %d, Verbindung wird neu aufgebaut\n", g, n);
+      tp20Disconnect();
+      connected = false;
+      delay(1000);
+      return;
     }
-    delay(80);  // kleine Pause zwischen den Anfragen
+    delay(100);
   }
   Serial.println("---");
-  delay(500);
-#endif
+  delay(300);
 }
