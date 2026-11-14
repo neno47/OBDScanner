@@ -1,5 +1,7 @@
 #include <Arduino.h>
 #include "driver/twai.h"
+#include <WiFi.h>
+#include <WebServer.h>
 
 // ---------------------------------------------------------------------------
 // OBDScanner: VW-Diagnose über CAN mit TP 2.0 (KWP2000), 500 kbit/s
@@ -7,6 +9,9 @@
 //
 // Ablauf: Kanalaufbau -> Kanalparameter -> StartDiagnosticSession (10 89)
 //         -> ECU-Kennung lesen (1A 9B) -> Messwertbloecke lesen (21 xx)
+//
+// Der Webserver laeuft in einer eigenen Task (Kern 0), die CAN-Abfrage in loop()
+// (Kern 1). Die Werte werden ueber eine Struktur mit Mutex ausgetauscht.
 //
 // Es werden ausschliesslich lesende Dienste verwendet.
 // ---------------------------------------------------------------------------
@@ -22,7 +27,56 @@ static const uint8_t BLOCKS[] = {1, 2, 3, 4};
 static uint32_t txId = 0;  // ID, auf der der Tester sendet (Steuergeraet hoert zu)
 static uint32_t rxId = 0;  // ID, auf der das Steuergeraet sendet
 static uint8_t txSeq = 0;
-static bool connected = false;
+static volatile bool connected = false;
+static uint32_t nextConnectAt = 0;  // fruehester Zeitpunkt fuer den naechsten Verbindungsversuch
+
+// ---------------------------------------------------------------------------
+// Gemeinsame Werte (CAN-Abfrage schreibt, Webserver liest)
+// ---------------------------------------------------------------------------
+struct Values {
+  float rpm = 0;
+  float coolant = 0;
+};
+static Values values;
+static SemaphoreHandle_t valuesMutex;
+
+static void setValues(float rpm, float coolant) {
+  xSemaphoreTake(valuesMutex, portMAX_DELAY);
+  values.rpm = rpm;
+  values.coolant = coolant;
+  xSemaphoreGive(valuesMutex);
+}
+
+static Values getValues() {
+  xSemaphoreTake(valuesMutex, portMAX_DELAY);
+  Values v = values;
+  xSemaphoreGive(valuesMutex);
+  return v;
+}
+
+// ---------------------------------------------------------------------------
+// Webserver
+// ---------------------------------------------------------------------------
+static WebServer server(80);
+
+static void setupWeb() {
+  WiFi.softAP("OBDScanner", "12345678");  // eigenes WLAN
+  server.on("/values", []() {
+    Values v = getValues();
+    String j = "{\"rpm\":" + String(v.rpm, 0) +
+               ",\"coolant\":" + String(v.coolant, 1) +
+               ",\"connected\":" + String(connected ? "true" : "false") + "}";
+    server.send(200, "application/json", j);
+  });
+  server.begin();
+}
+
+static void webTask(void *) {
+  for (;;) {
+    server.handleClient();
+    vTaskDelay(pdMS_TO_TICKS(2));  // gibt anderen Tasks Zeit
+  }
+}
 
 // ---------------------------------------------------------------------------
 // CAN-Grundfunktionen
@@ -207,6 +261,9 @@ static bool decodeMeasure(uint8_t t, uint8_t a, uint8_t b, float &v, const char 
   }
 }
 
+static float curRpm = 0;
+static float curCoolant = 0;  // Typ 0x05 = Temperatur (vermutlich Kuehlmittel)
+
 static void printBlock(uint8_t group, const uint8_t *r, int n) {
   Serial.printf("Block %03u:", group);
   for (int i = 2; i + 2 < n; i += 3) {
@@ -214,11 +271,14 @@ static void printBlock(uint8_t group, const uint8_t *r, int n) {
     const char *unit;
     if (decodeMeasure(r[i], r[i + 1], r[i + 2], v, unit)) {
       Serial.printf("  [%02X %3u %3u] = %.1f %s", r[i], r[i + 1], r[i + 2], v, unit);
+      if (r[i] == 0x01) curRpm = v;
+      if (r[i] == 0x05) curCoolant = v;
     } else {
       Serial.printf("  [%02X %3u %3u]", r[i], r[i + 1], r[i + 2]);
     }
   }
   Serial.println();
+  setValues(curRpm, curCoolant);  // fuer den Webserver bereitstellen
 }
 
 // ---------------------------------------------------------------------------
@@ -258,18 +318,30 @@ void setup() {
   delay(500);
   Serial.println("\nOBDScanner startet (TP 2.0)");
 
+  valuesMutex = xSemaphoreCreateMutex();
+
   if (!canBegin()) {
     while (true) delay(1000);
   }
+
+  setupWeb();
+  xTaskCreatePinnedToCore(webTask, "web", 8192, nullptr, 1, nullptr, 0);
 }
 
 void loop() {
   canCheckBus();
 
+  values.rpm+=1;
+
+  // Ohne Verbindung wird nichts gesendet, nur alle 3 s ein neuer Versuch
   if (!connected) {
-    if (!openSession()) {
-      Serial.println("Verbindung fehlgeschlagen, neuer Versuch in 3 s");
-      delay(3000);
+    if ((int32_t)(millis() - nextConnectAt) >= 0) {
+      if (!openSession()) {
+        Serial.println("Verbindung fehlgeschlagen, neuer Versuch in 3 s");
+        nextConnectAt = millis() + 3000;
+      }
+    } else {
+      delay(10);
     }
     return;
   }
@@ -286,7 +358,7 @@ void loop() {
       Serial.printf("Block %03u: Fehler %d, Verbindung wird neu aufgebaut\n", g, n);
       tp20Disconnect();
       connected = false;
-      delay(1000);
+      nextConnectAt = millis() + 1000;
       return;
     }
     delay(100);
