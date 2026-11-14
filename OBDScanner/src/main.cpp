@@ -59,15 +59,49 @@ static Values getValues() {
 // ---------------------------------------------------------------------------
 static WebServer server(80);
 
+const char PAGE[] PROGMEM = R"rawliteral(
+<!doctype html>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OBDScanner</title>
+</head><body>
+<h2>Drehzahl: <span id="r">-</span> U/min</h2>
+<h2>Kühlmittel: <span id="c">-</span> °C</h2>
+<p id="s"></p>
+<script>
+async function update() {
+  try {
+    const res = await fetch("/values");
+    const d = await res.json();
+    document.getElementById("r").textContent = d.rpm;
+    document.getElementById("c").textContent = d.coolant;
+    document.getElementById("s").textContent =
+      d.connected ? "" : "Keine Verbindung zum Steuergerät";
+  } catch (e) {
+    document.getElementById("s").textContent = "ESP32 nicht erreichbar";
+  }
+  setTimeout(update, 250);
+}
+update();
+</script>
+</body></html>
+)rawliteral";
+
+
+
 static void setupWeb() {
   WiFi.softAP("OBDScanner", "12345678");  // eigenes WLAN
   server.on("/values", []() {
+    
     Values v = getValues();
     String j = "{\"rpm\":" + String(v.rpm, 0) +
                ",\"coolant\":" + String(v.coolant, 1) +
                ",\"connected\":" + String(connected ? "true" : "false") + "}";
+
     server.send(200, "application/json", j);
   });
+  server.on("/", []() { server.send_P(200, "text/html", PAGE); });
   server.begin();
 }
 
