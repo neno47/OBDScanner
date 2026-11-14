@@ -19,6 +19,9 @@
 #define CAN_TX_PIN GPIO_NUM_21
 #define CAN_RX_PIN GPIO_NUM_22
 
+// 1 = jede Antwort seriell ausgeben. Das bremst stark (115200 Baud ~ 10 ms pro Zeile)!
+#define PRINT_BLOCKS 0
+
 static const uint8_t ECU_ADDR = 0x01;  // logische Adresse: Motorsteuergeraet
 
 // Messwertbloecke, die zyklisch gelesen werden
@@ -70,9 +73,10 @@ const char PAGE[] PROGMEM = R"rawliteral(
 <h2>Kühlmittel: <span id="c">-</span> °C</h2>
 <p id="s"></p>
 <script>
+const POLL_MS = 0;  // Pause zwischen zwei Abfragen (0 = sofort nach der Antwort)
 async function update() {
   try {
-    const res = await fetch("/values");
+    const res = await fetch("/values", { cache: "no-store" });
     const d = await res.json();
     document.getElementById("r").textContent = d.rpm;
     document.getElementById("c").textContent = d.coolant;
@@ -81,24 +85,20 @@ async function update() {
   } catch (e) {
     document.getElementById("s").textContent = "ESP32 nicht erreichbar";
   }
-  setTimeout(update, 250);
+  setTimeout(update, POLL_MS);
 }
 update();
 </script>
 </body></html>
 )rawliteral";
 
-
-
 static void setupWeb() {
   WiFi.softAP("OBDScanner", "12345678");  // eigenes WLAN
   server.on("/values", []() {
-    
     Values v = getValues();
     String j = "{\"rpm\":" + String(v.rpm, 0) +
                ",\"coolant\":" + String(v.coolant, 1) +
                ",\"connected\":" + String(connected ? "true" : "false") + "}";
-
     server.send(200, "application/json", j);
   });
   server.on("/", []() { server.send_P(200, "text/html", PAGE); });
@@ -299,19 +299,26 @@ static float curRpm = 0;
 static float curCoolant = 0;  // Typ 0x05 = Temperatur (vermutlich Kuehlmittel)
 
 static void printBlock(uint8_t group, const uint8_t *r, int n) {
+  (void)group;
+#if PRINT_BLOCKS
   Serial.printf("Block %03u:", group);
+#endif
   for (int i = 2; i + 2 < n; i += 3) {
     float v;
     const char *unit;
     if (decodeMeasure(r[i], r[i + 1], r[i + 2], v, unit)) {
-      Serial.printf("  [%02X %3u %3u] = %.1f %s", r[i], r[i + 1], r[i + 2], v, unit);
       if (r[i] == 0x01) curRpm = v;
       if (r[i] == 0x05) curCoolant = v;
+#if PRINT_BLOCKS
+      Serial.printf("  [%02X %3u %3u] = %.1f %s", r[i], r[i + 1], r[i + 2], v, unit);
     } else {
       Serial.printf("  [%02X %3u %3u]", r[i], r[i + 1], r[i + 2]);
+#endif
     }
   }
+#if PRINT_BLOCKS
   Serial.println();
+#endif
   setValues(curRpm, curCoolant);  // fuer den Webserver bereitstellen
 }
 
@@ -365,8 +372,6 @@ void setup() {
 void loop() {
   canCheckBus();
 
-  values.rpm+=1;
-
   // Ohne Verbindung wird nichts gesendet, nur alle 3 s ein neuer Versuch
   if (!connected) {
     if ((int32_t)(millis() - nextConnectAt) >= 0) {
@@ -380,12 +385,16 @@ void loop() {
     return;
   }
 
+  static uint32_t reads = 0;
+  static uint32_t lastStat = 0;
+
   for (uint8_t g : BLOCKS) {
     uint8_t req[2] = {0x21, g};  // readDataByLocalIdentifier (Messwertblock)
     uint8_t resp[64];
     int n = kwp(req, 2, resp, sizeof(resp));
     if (n >= 2 && resp[0] == 0x61) {
       printBlock(g, resp, n);
+      reads++;
     } else if (n >= 3 && resp[0] == 0x7F) {
       Serial.printf("Block %03u: Steuergeraet lehnt ab (Dienst %02X, Code %02X)\n", g, resp[1], resp[2]);
     } else {
@@ -395,8 +404,13 @@ void loop() {
       nextConnectAt = millis() + 1000;
       return;
     }
-    delay(100);
   }
-  Serial.println("---");
-  delay(300);
+
+  // Einmal pro Sekunde die tatsaechliche Messrate ausgeben
+  uint32_t now = millis();
+  if (now - lastStat >= 1000) {
+    Serial.printf("Messrate: %lu Bloecke/s\n", (unsigned long)(reads * 1000UL / (now - lastStat)));
+    reads = 0;
+    lastStat = now;
+  }
 }
